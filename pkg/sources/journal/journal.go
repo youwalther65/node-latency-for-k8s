@@ -12,8 +12,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package messages is a latency timing source for /var/log/messages
-package messages
+// Package journal is a latency timing source for /var/log/journal/*
+package journal
 
 import (
 	"regexp"
@@ -23,21 +23,21 @@ import (
 )
 
 var (
-	Name            = "Messages"
-	DefaultPath     = "/var/log/messages*"
-	TimestampFormat = regexp.MustCompile(`[A-Z][a-z]+[ ]+[0-9][0-9]? [0-9]{2}:[0-9]{2}:[0-9]{2}`)
-	TimestampLayout = "Jan 2 15:04:05 2006"
+	Name            = "Journal"
+	DefaultPath     = "/node/var/log/journal/*"
+	TimestampFormat = regexp.MustCompile(`[0-9]{4}\-[0-9]{2}\-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+[0-9]{4}`)
+	TimestampLayout = "2006-01-02T15:04:05-0700"
 )
 
-// Source is the /var/log/messages log source
+// Source is the /var/log/journal log source
 type Source struct {
-	logReader *sources.LogReader
+	journalReader *sources.JournalReader
 }
 
-// New instantiates a new instance of messages source
+// New instantiates a new instance of a journal source
 func New(path string) *Source {
 	return &Source{
-		logReader: &sources.LogReader{
+		journalReader: &sources.JournalReader{
 			Path:            path,
 			Glob:            true,
 			TimestampRegex:  TimestampFormat,
@@ -46,14 +46,14 @@ func New(path string) *Source {
 	}
 }
 
-// ClearCache will clear the log reader cache
+// ClearCache will clear the journal reader cache
 func (s Source) ClearCache() {
-	s.logReader.ClearCache()
+	s.journalReader.ClearCache()
 }
 
-// String is a human readable string of the source, usually the log file path
+// String is a human readable string of the source, usually the journal file path or directory
 func (s Source) String() string {
-	return s.logReader.Path
+	return s.journalReader.Path
 }
 
 // Name is the name of the source
@@ -64,13 +64,13 @@ func (s Source) Name() string {
 // FindByRegex is a helper func that returns a FindFunc to search for a regex in a log source that can be used in an Event
 func (s Source) FindByRegex(re *regexp.Regexp) sources.FindFunc {
 	return func(_ sources.Source, log []byte) ([]string, error) {
-		return s.logReader.Find(re)
+		return s.journalReader.Find(re)
 	}
 }
 
 // Find will use the Event's FindFunc and CommentFunc to search the log source and return the results based on the Event's matcher
 func (s Source) Find(event *sources.Event) ([]sources.FindResult, error) {
-	logBytes, err := s.logReader.Read()
+	logBytes, err := s.journalReader.Read()
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (s Source) Find(event *sources.Event) ([]sources.FindResult, error) {
 	}
 	var results []sources.FindResult
 	for _, line := range matchedLines {
-		ts, err := s.logReader.ParseTimestamp(line)
+		ts, err := s.journalReader.ParseTimestamp(line)
 		comment := ""
 		if event.CommentFn != nil {
 			comment = event.CommentFn(line)

@@ -43,8 +43,8 @@ import (
 	"github.com/awslabs/node-latency-for-k8s/pkg/sources/awsnode"
 	ec2src "github.com/awslabs/node-latency-for-k8s/pkg/sources/ec2"
 	imdssrc "github.com/awslabs/node-latency-for-k8s/pkg/sources/imds"
+	"github.com/awslabs/node-latency-for-k8s/pkg/sources/journal"
 	k8ssrc "github.com/awslabs/node-latency-for-k8s/pkg/sources/k8s"
-	"github.com/awslabs/node-latency-for-k8s/pkg/sources/messages"
 )
 
 // Measurer holds registered sources and events to use for timing runs
@@ -67,19 +67,22 @@ type Measurement struct {
 
 // Metadata provides data about the node where measurements are executed
 type Metadata struct {
-	Region           string `json:"region"`
-	InstanceType     string `json:"instanceType"`
-	InstanceID       string `json:"instanceID"`
-	AccountID        string `json:"accountID"`
-	Architecture     string `json:"architecture"`
-	AvailabilityZone string `json:"availabilityZone"`
-	PrivateIP        string `json:"privateIP"`
-	AMIID            string `json:"amiID"`
+	Region            string `json:"region"`
+	InstanceType      string `json:"instanceType"`
+	InstanceID        string `json:"instanceID"`
+	AccountID         string `json:"accountID"`
+	Architecture      string `json:"architecture"`
+	AvailabilityZone  string `json:"availabilityZone"`
+	PrivateIP         string `json:"privateIP"`
+	AMIID             string `json:"amiID"`
+	KubernetesVersion string `json:"kubernetesVersion"`
 }
 
 // ChartOptions allows configuration of the markdown chart
 type ChartOptions struct {
-	HiddenColumns []string
+	HiddenColumns        []string
+	ShowUnresolvedEvents bool
+	LogWarnings          bool
 }
 
 // Chart column label consts
@@ -92,25 +95,22 @@ const (
 
 // Default Event regular expressions
 var (
-	vmInit                = regexp.MustCompile(`.*kernel: Linux version.*`)
+	vmInit                = regexp.MustCompile(`.*Linux version.*`)
 	networkStart          = regexp.MustCompile(`.*Reached target Network \(Pre\).*`)
 	networkReady          = regexp.MustCompile(`.*Reached target Network\..*`)
-	cloudInitInitialStart = regexp.MustCompile(`.*cloud-init: Cloud-init v.* running 'init'.*`)
-	cloudInitConfigStart  = regexp.MustCompile(`.*cloud-init: Cloud-init v.* running 'modules:config'.*`)
-	cloudInitFinalStart   = regexp.MustCompile(`.*cloud-init: Cloud-init v.* running 'modules:final'.*`)
-	cloudInitFinalFinish  = regexp.MustCompile(`.*cloud-init: Cloud-init v.* finished`)
+	cloudInitInitialStart = regexp.MustCompile(`.*Cloud-init v.* running 'init'.*`)
+	cloudInitConfigStart  = regexp.MustCompile(`.*Cloud-init v.* running 'modules:config'.*`)
+	cloudInitFinalStart   = regexp.MustCompile(`.*Cloud-init v.* running 'modules:final'.*`)
+	cloudInitFinalFinish  = regexp.MustCompile(`.*Cloud-init v.* finished.*`)
 	containerdStart       = regexp.MustCompile(`.*Starting containerd container runtime.*`)
 	containerdInitialized = regexp.MustCompile(`.*Started containerd container runtime.*`)
-	kubeletStart          = regexp.MustCompile(`.*Starting Kubernetes Kubelet.*`)
+	kubeletStart          = regexp.MustCompile(`.*"Kubelet version" kubeletVersion=.*`)
 	kubeletInitialized    = regexp.MustCompile(`.*Started kubelet.*`)
-	kubeletRegistered     = regexp.MustCompile(`.*Successfully registered node.*`)
 	kubeProxyStart        = regexp.MustCompile(`.*CreateContainer within sandbox .*Name:kube-proxy.* returns container id.*`)
 	vpcCNIInitStart       = regexp.MustCompile(`.*CreateContainer within sandbox .*Name:aws-vpc-cni-init.* returns container id.*`)
 	awsNodeStart          = regexp.MustCompile(`.*CreateContainer within sandbox .*Name:aws-node.* returns container id.*`)
 	vpcCNIInitialized     = regexp.MustCompile(`.*Successfully copied CNI plugin binary and config file.*`)
-	nodeReady             = regexp.MustCompile(`.*event="NodeReady".*`)
 	throttled             = regexp.MustCompile(`.*Waited for .* due to client-side throttling, not priority and fairness, request: .*`)
-	podReadyStr           = `.*%s/.* Type:ContainerStarted.*`
 )
 
 // New creates a new instance of a Measurer
@@ -190,7 +190,11 @@ func (m *Measurer) Measure(ctx context.Context) *Measurement {
 	for _, event := range m.events {
 		results, err := event.Src.Find(event)
 		if len(results) == 0 {
-			results = []sources.FindResult{}
+			results = append(results, sources.FindResult{
+				Timestamp: time.Time{},
+				Comment:   fmt.Sprintf("no event found in src %s", event.SrcName),
+				Err:       multierr.Append(err, fmt.Errorf("event %s was not found in source %s", event.Name, event.SrcName)),
+			})
 		}
 		for _, result := range results {
 			timings = append(timings, &sources.Timing{
@@ -241,11 +245,6 @@ func (m *Measurer) MeasureUntil(ctx context.Context, timeout time.Duration, retr
 	for !done && time.Since(startTime) < timeout {
 		done = false
 		measurement = m.Measure(ctx)
-		for _, m := range measurement.Timings {
-			if m.Error != nil {
-				log.Printf("Unable to retrieve timing for Event \"%s\": %v\n", m.Event.Name, m.Error)
-			}
-		}
 		measuredEvents := lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return t.Error == nil })
 		measuredTerminalEvents := lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return t.Event.Terminal && t.Error == nil })
 		// check if there are any terminal events, if so, check if they have completed successfully
@@ -264,12 +263,13 @@ func (m *Measurer) MeasureUntil(ctx context.Context, timeout time.Duration, retr
 		}
 		time.Sleep(retryDelay)
 	}
-	if terminalEvents > 0 {
+	measuredTerminalEvents := lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return t.Event.Terminal && t.Error == nil })
+	if measuredTerminalEvents != terminalEvents {
 		unmeasuredTerminalEvents := lo.Filter(m.events, func(e *sources.Event, _ int) bool {
-			return e.Terminal && lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return t.Event.Name == e.Name }) == 0
+			return e.Terminal && lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return e.Name == t.Event.Name && t.Error != nil }) > 0
 		})
 		unmeasuredTerminalEventNames := lo.Map(unmeasuredTerminalEvents, func(e *sources.Event, _ int) string { return e.Name })
-		return measurement, fmt.Errorf("unable to measure terminal events: %v", unmeasuredTerminalEventNames)
+		return measurement, fmt.Errorf("unable to measure terminal events: %v", strings.Join(unmeasuredTerminalEventNames, ", "))
 	}
 	unmeasuredEvents := lo.Filter(m.events, func(e *sources.Event, _ int) bool {
 		return lo.CountBy(measurement.Timings, func(t *sources.Timing) bool { return t.Event.Name == e.Name }) == 0
@@ -290,24 +290,35 @@ func (m *Measurer) getMetadata(ctx context.Context) (*Metadata, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve instance-identity document: %w", err)
 	}
+	versionInfo, err := m.k8sClientset.ServerVersion()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve k8s version info: %w", err)
+	}
+
 	return &Metadata{
-		Region:           idDoc.Region,
-		InstanceType:     idDoc.InstanceType,
-		InstanceID:       idDoc.InstanceID,
-		AccountID:        idDoc.AccountID,
-		Architecture:     idDoc.Architecture,
-		AvailabilityZone: idDoc.AvailabilityZone,
-		AMIID:            idDoc.ImageID,
-		PrivateIP:        idDoc.PrivateIP,
+		Region:            idDoc.Region,
+		InstanceType:      idDoc.InstanceType,
+		InstanceID:        idDoc.InstanceID,
+		AccountID:         idDoc.AccountID,
+		Architecture:      idDoc.Architecture,
+		AvailabilityZone:  idDoc.AvailabilityZone,
+		AMIID:             idDoc.ImageID,
+		PrivateIP:         idDoc.PrivateIP,
+		KubernetesVersion: versionInfo.GitVersion,
 	}, nil
 }
 
 // Chart generates a markdown chart view of a Measurement
 func (m *Measurement) Chart(opts ChartOptions) {
+	for _, t := range m.Timings {
+		if t.Error != nil && opts.LogWarnings {
+			log.Printf("Error with event \"%s\" timing: %v\n", t.Event.Name, t.Error)
+		}
+	}
 	if m.Metadata != nil {
-		fmt.Printf("### %s (%s) | %s | %s | %s | %s\n",
+		fmt.Printf("### %s (%s) | %s | %s | %s | %s | K8s %s\n",
 			m.Metadata.InstanceID, m.Metadata.PrivateIP, m.Metadata.InstanceType, m.Metadata.Architecture,
-			m.Metadata.AvailabilityZone, m.Metadata.AMIID)
+			m.Metadata.AvailabilityZone, m.Metadata.AMIID, m.Metadata.KubernetesVersion)
 	}
 	table := tablewriter.NewWriter(os.Stdout)
 	headers := []string{ChartColumnEvent, ChartColumnTimestamp, ChartColumnT, ChartColumnComment}
@@ -315,8 +326,7 @@ func (m *Measurement) Chart(opts ChartOptions) {
 
 	var data [][]string
 	for _, t := range m.Timings {
-		if t.Error != nil {
-			log.Printf("Error with event \"%s\" timing: %v\n", t.Event.Name, t.Error)
+		if t.Error != nil && !opts.ShowUnresolvedEvents {
 			continue
 		}
 		data = append(data, filterColumns(opts.HiddenColumns, headers, []string{
@@ -414,10 +424,11 @@ func (m *Measurement) metricDimensions(experimentDimension string) map[string]st
 	}
 	if m.Metadata != nil {
 		dimensions = lo.Assign(dimensions, map[string]string{
-			"instanceType":     m.Metadata.InstanceType,
-			"amiID":            m.Metadata.AMIID,
-			"region":           m.Metadata.Region,
-			"availabilityZone": m.Metadata.AvailabilityZone,
+			"instanceType":      m.Metadata.InstanceType,
+			"amiID":             m.Metadata.AMIID,
+			"region":            m.Metadata.Region,
+			"availabilityZone":  m.Metadata.AvailabilityZone,
+			"kubernetesVersion": m.Metadata.KubernetesVersion,
 		})
 	}
 	return dimensions
@@ -426,7 +437,7 @@ func (m *Measurement) metricDimensions(experimentDimension string) map[string]st
 // RegisterDefaultSources registers the default sources to the Measurer
 func (m *Measurer) RegisterDefaultSources() *Measurer {
 	m.RegisterSources([]sources.Source{
-		messages.New(messages.DefaultPath),
+		journal.New(journal.DefaultPath),
 		awsnode.New(awsnode.DefaultPath),
 	}...)
 	if m.imdsClient != nil {
@@ -490,107 +501,107 @@ func (m *Measurer) RegisterDefaultEvents() (*Measurer, error) {
 		{
 			Name:          "VM Initialized",
 			Metric:        "vm_initialized",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(vmInit),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(vmInit),
 		},
 		{
 			Name:          "Network Start",
 			Metric:        "network_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(networkStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(networkStart),
 		},
 		{
 			Name:          "Network Ready",
 			Metric:        "network_ready",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(networkReady),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(networkReady),
 		},
 		{
 			Name:          "Cloud-Init Initial Start",
 			Metric:        "cloudinit_initial_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(cloudInitInitialStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(cloudInitInitialStart),
 		},
 		{
 			Name:          "Cloud-Init Config Start",
 			Metric:        "cloudinit_config_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(cloudInitConfigStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(cloudInitConfigStart),
 		},
 		{
 			Name:          "Cloud-Init Final Start",
 			Metric:        "cloudinit_final_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(cloudInitFinalStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(cloudInitFinalStart),
 		},
 		{
 			Name:          "Cloud-Init Final Finish",
 			Metric:        "cloudinit_final_finish",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(cloudInitFinalFinish),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(cloudInitFinalFinish),
 		},
 		{
 			Name:          "Containerd Start",
 			Metric:        "conatinerd_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(containerdStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(containerdStart),
 		},
 		{
 			Name:          "Containerd Initialized",
 			Metric:        "conatinerd_initialized",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(containerdInitialized),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(containerdInitialized),
 		},
 		{
 			Name:          "Kubelet Start",
 			Metric:        "kubelet_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(kubeletStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(kubeletStart),
 		},
 		{
 			Name:          "Kubelet Initialized",
 			Metric:        "kubelet_initialized",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(kubeletInitialized),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(kubeletInitialized),
 		},
 		{
 			Name:          "Kubelet Registered",
 			Metric:        "kubelet_registered",
-			SrcName:       messages.Name,
+			SrcName:       k8ssrc.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(kubeletRegistered),
+			FindFn:        lo.Must(m.GetSource(k8ssrc.Name)).(*k8ssrc.Source).FindNodeRegisterTime(),
 		},
 		{
 			Name:          "Kube-Proxy Start",
 			Metric:        "kube_proxy_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(kubeProxyStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(kubeProxyStart),
 		},
 		{
 			Name:          "VPC CNI Init Start",
 			Metric:        "vpc_cni_init_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(vpcCNIInitStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(vpcCNIInitStart),
 		},
 		{
 			Name:          "AWS Node Start",
 			Metric:        "aws_node_start",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(awsNodeStart),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(awsNodeStart),
 		},
 		{
 			Name:          "VPC CNI Plugin Initialized",
@@ -602,26 +613,34 @@ func (m *Measurer) RegisterDefaultEvents() (*Measurer, error) {
 		{
 			Name:          "Kube-APIServer Throttled",
 			Metric:        "kube_apiserver_throttled",
-			SrcName:       messages.Name,
+			SrcName:       journal.Name,
 			MatchSelector: sources.EventMatchSelectorAll,
 			CommentFn:     sources.CommentMatchedLine(),
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(throttled),
+			FindFn:        lo.Must(m.GetSource(journal.Name)).(*journal.Source).FindByRegex(throttled),
 		},
 		{
 			Name:          "Node Ready",
 			Metric:        "node_ready",
-			SrcName:       messages.Name,
+			SrcName:       k8ssrc.Name,
 			Terminal:      true,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(nodeReady),
+			FindFn:        lo.Must(m.GetSource(k8ssrc.Name)).(*k8ssrc.Source).FindNodeReadyTime(),
+		},
+		{
+			Name:          "Pod Scheduled",
+			Metric:        "pod_scheduled",
+			SrcName:       k8ssrc.Name,
+			Terminal:      false,
+			MatchSelector: sources.EventMatchSelectorFirst,
+			FindFn:        lo.Must(m.GetSource(k8ssrc.Name)).(*k8ssrc.Source).FindPodScheduledTime(),
 		},
 		{
 			Name:          "Pod Ready",
 			Metric:        "pod_ready",
-			SrcName:       messages.Name,
+			SrcName:       k8ssrc.Name,
 			Terminal:      true,
 			MatchSelector: sources.EventMatchSelectorFirst,
-			FindFn:        lo.Must(m.GetSource(messages.Name)).(*messages.Source).FindByRegex(regexp.MustCompile(fmt.Sprintf(podReadyStr, m.podNamespace))),
+			FindFn:        lo.Must(m.GetSource(k8ssrc.Name)).(*k8ssrc.Source).FindPodReadyTime(),
 		},
 	}...)
 }

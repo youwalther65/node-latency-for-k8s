@@ -38,7 +38,7 @@ spec:
             {{- toYaml .Values.env | nindent 12 }}
           volumeMounts:
             - name: logs
-              mountPath: /var/log
+              mountPath: /node/var/log
               readOnly: true
       volumes:
         - name: logs

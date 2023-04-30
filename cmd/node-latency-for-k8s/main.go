@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -48,21 +49,28 @@ var (
 	commit  string
 )
 
+//go:generate cp -r ../../ATTRIBUTION.md ./
+//go:embed ATTRIBUTION.md
+var attribution string
+
 type Options struct {
-	CloudWatch          bool
-	Prometheus          bool
-	ExperimentDimension string
-	TimeoutSeconds      int
-	RetryDelaySeconds   int
-	MetricsPort         int
-	IMDSEndpoint        string
-	Kubeconfig          string
-	PodNamespace        string
-	NodeName            string
-	NoIMDS              bool
-	Output              string
-	NoComments          bool
-	Version             bool
+	Attribution          bool
+	CloudWatch           bool
+	Prometheus           bool
+	ExperimentDimension  string
+	TimeoutSeconds       int
+	RetryDelaySeconds    int
+	MetricsPort          int
+	IMDSEndpoint         string
+	Kubeconfig           string
+	PodNamespace         string
+	NodeName             string
+	NoIMDS               bool
+	Output               string
+	NoComments           bool
+	ShowUnresolvedEvents bool
+	Verbose              bool
+	Version              bool
 }
 
 //nolint:gocyclo
@@ -73,6 +81,10 @@ func main() {
 	if options.Version {
 		fmt.Printf("%s\n", version)
 		fmt.Printf("Git Commit: %s\n", commit)
+		os.Exit(0)
+	}
+	if options.Attribution {
+		fmt.Println(attribution)
 		os.Exit(0)
 	}
 	ctx := context.Background()
@@ -138,7 +150,7 @@ func main() {
 		if options.NoComments {
 			hiddenColumns = append(hiddenColumns, latency.ChartColumnComment)
 		}
-		measurement.Chart(latency.ChartOptions{HiddenColumns: hiddenColumns})
+		measurement.Chart(latency.ChartOptions{HiddenColumns: hiddenColumns, ShowUnresolvedEvents: options.ShowUnresolvedEvents, LogWarnings: options.Verbose})
 	}
 
 	// Emit CloudWatch Metrics if flag is enabled
@@ -181,7 +193,7 @@ func MustParseFlags(f *flag.FlagSet) Options {
 	f.BoolVar(&options.Prometheus, "prometheus-metrics", boolEnv("PROMETHEUS_METRICS", false), "Expose a Prometheus metrics endpoint (this runs as a daemon), default: false")
 	f.IntVar(&options.MetricsPort, "metrics-port", intEnv("METRICS_PORT", 2112), "The port to serve prometheus metrics from, default: 2112")
 	f.StringVar(&options.ExperimentDimension, "experiment-dimension", strEnv("EXPERIMENT_DIMENSION", "none"), "Custom dimension to add to experiment metrics, default: none")
-	f.IntVar(&options.TimeoutSeconds, "timeout", intEnv("TIMEOUT", 600), "Timeout in seconds for how long event timings will try to be retrieved, default: 600")
+	f.IntVar(&options.TimeoutSeconds, "timeout", intEnv("TIMEOUT", 300), "Timeout in seconds for how long event timings will try to be retrieved, default: 300")
 	f.IntVar(&options.RetryDelaySeconds, "retry-delay", intEnv("RETRY_DELAY", 5), "Delay in seconds in-between timing retrievals, default: 5")
 	f.StringVar(&options.IMDSEndpoint, "imds-endpoint", strEnv("IMDS_ENDPOINT", "http://169.254.169.254"), "IMDS endpoint for testing, default: http://169.254.169.254")
 	f.BoolVar(&options.NoIMDS, "no-imds", boolEnv("NO_IMDS", false), "Do not use EC2 Instance Metadata Service (IMDS), default: false")
@@ -190,7 +202,9 @@ func MustParseFlags(f *flag.FlagSet) Options {
 	f.StringVar(&options.Output, "output", strEnv("OUTPUT", "markdown"), "output type (markdown or json), default: markdown")
 	f.BoolVar(&options.NoComments, "no-comments", boolEnv("NO_COMMENTS", false), "Hide the comments column in the markdown chart output, default: false")
 	f.BoolVar(&options.Version, "version", false, "version information")
+	f.BoolVar(&options.Verbose, "verbose", false, "verbose logging - log event warnings")
 	f.StringVar(&options.Kubeconfig, "kubeconfig", defaultKubeconfig(), "(optional) absolute path to the kubeconfig file")
+	f.BoolVar(&options.ShowUnresolvedEvents, "show-unresolved-events", false, "show all events, even ones not resolved to timestamps")
 	lo.Must0(f.Parse(os.Args[1:]))
 	return options
 }

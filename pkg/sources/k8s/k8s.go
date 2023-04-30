@@ -17,8 +17,8 @@ package k8s
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/samber/lo"
@@ -66,29 +66,106 @@ func (s Source) Name() string {
 // FindPodCreationTime retrieves the Pod creation time
 func (s *Source) FindPodCreationTime() sources.FindFunc {
 	return func(_ sources.Source, _ []byte) ([]string, error) {
-		ctx := context.Background()
-		pods, err := s.clientset.CoreV1().Pods(s.podNamespace).List(ctx, v1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", s.nodeName)})
+		pod, err := s.FindPod()
 		if err != nil {
 			return nil, err
 		}
-		podMatches := lo.Map(pods.Items, func(p corev1.Pod, _ int) string {
-			podBytes, err := json.Marshal(p)
-			if err != nil {
-				return ""
-			}
-			return string(podBytes)
-		})
-		return lo.Filter(podMatches, func(p string, _ int) bool { return p != "" }), nil
+		return []string{fmt.Sprint(pod.CreationTimestamp.Unix())}, nil
 	}
 }
 
-// ParseTimeFor parses an event and returns the time
-func (s *Source) ParseTimeFor(event []byte) (time.Time, error) {
-	var pod *corev1.Pod
-	if err := json.Unmarshal(event, &pod); err == nil && !pod.CreationTimestamp.IsZero() {
-		return pod.CreationTimestamp.Time, nil
+// FindPodReadyTime retrieves the Pod Ready time
+func (s *Source) FindPodReadyTime() sources.FindFunc {
+	return func(_ sources.Source, _ []byte) ([]string, error) {
+		pod, err := s.FindPod()
+		if err != nil {
+			return nil, err
+		}
+		podReady, ok := lo.Find(pod.Status.Conditions, func(condition corev1.PodCondition) bool {
+			return condition.Type == corev1.PodReady
+		})
+		if !ok {
+			return nil, fmt.Errorf("unable to find pod ready condition")
+		}
+		return []string{fmt.Sprint(podReady.LastTransitionTime.Unix())}, nil
 	}
-	return time.Time{}, fmt.Errorf("unable to parse event")
+}
+
+// FindPodScheduledTime retrieves the Pod Scheduled time
+func (s *Source) FindPodScheduledTime() sources.FindFunc {
+	return func(_ sources.Source, _ []byte) ([]string, error) {
+		pod, err := s.FindPod()
+		if err != nil {
+			return nil, err
+		}
+		podScheduled, ok := lo.Find(pod.Status.Conditions, func(condition corev1.PodCondition) bool {
+			return condition.Type == corev1.PodScheduled
+		})
+		if !ok {
+			return nil, fmt.Errorf("unable to find pod scheduled condition")
+		}
+		return []string{fmt.Sprint(podScheduled.LastTransitionTime.Unix())}, nil
+	}
+}
+
+// FindPod is a helper that retrieves a pod based on the source nodeName
+func (s *Source) FindPod() (*corev1.Pod, error) {
+	ctx := context.Background()
+	pods, err := s.clientset.CoreV1().Pods(s.podNamespace).List(ctx, v1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", s.nodeName)})
+	if err != nil {
+		return nil, err
+	}
+	if len(pods.Items) == 0 {
+		return nil, fmt.Errorf("unable to find pods")
+	}
+	return &pods.Items[0], nil
+}
+
+// FindNodeReadyTime retrieves the Node Ready time
+func (s *Source) FindNodeReadyTime() sources.FindFunc {
+	return func(_ sources.Source, _ []byte) ([]string, error) {
+		node, err := s.FindNode()
+		if err != nil {
+			return nil, err
+		}
+		nodeMatches := lo.FilterMap(node.Status.Conditions, func(condition corev1.NodeCondition, _ int) (string, bool) {
+			return fmt.Sprint(condition.LastTransitionTime.Unix()), condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue
+		})
+		if len(nodeMatches) == 0 {
+			return nil, fmt.Errorf("unable to find nodes with Ready condition")
+		}
+		return nodeMatches, nil
+	}
+}
+
+// FindNodeRegisterTime retrieves the Node Creation time
+func (s *Source) FindNodeRegisterTime() sources.FindFunc {
+	return func(_ sources.Source, _ []byte) ([]string, error) {
+		node, err := s.FindNode()
+		if err != nil {
+			return nil, err
+		}
+		return []string{fmt.Sprint(node.CreationTimestamp.Unix())}, nil
+	}
+}
+
+// FindNode is a helper that retrieves a node based on the source nodeName and then
+func (s *Source) FindNode() (*corev1.Node, error) {
+	ctx := context.Background()
+	node, err := s.clientset.CoreV1().Nodes().Get(ctx, s.nodeName, v1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
+}
+
+// ParseTimeFor parses a Unix timestamp (time in seconds since the Epoch)
+func (s *Source) ParseTimeFor(unixSec []byte) (time.Time, error) {
+	unixTS, err := strconv.ParseInt(string(unixSec), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("unable to parse time for K8s event")
+	}
+	return time.Unix(unixTS, 0), nil
 }
 
 // Find will use the Event's FindFunc and CommentFunc to search the source and return the result

@@ -24,7 +24,7 @@ import (
 
 var (
 	Name            = "aws-node"
-	DefaultPath     = "/var/log/pods/kube-system_aws-node-*/aws-node/*.log"
+	DefaultPath     = "/node/var/log/pods/kube-system_aws-node-*/aws-node/*.log"
 	TimestampFormat = regexp.MustCompile(`[0-9]{4}\-[0-9]{2}\-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z`)
 	TimestampLayout = "2006-01-02T15:04:05.999999999Z"
 )
