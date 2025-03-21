@@ -17,10 +17,16 @@ RUN go mod download
 COPY . .
 RUN go build -o /bin/node-latency-for-k8s cmd/node-latency-for-k8s/main.go
 
-FROM public.ecr.aws/amazonlinux/amazonlinux:2
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal as journalctl
+WORKDIR /
+RUN dnf update -y && dnf install -y systemd && dnf clean all
+
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal 
 WORKDIR /
 COPY --from=builder /bin/node-latency-for-k8s .
 COPY --from=builder /app/THIRD_PARTY_LICENSES .
-RUN yum update -y && yum install -y systemd
+WORKDIR /usr/bin
+COPY --from=journalctl /usr/bin/journalctl .
+WORKDIR /
 USER 1000
 ENTRYPOINT ["/node-latency-for-k8s"]
