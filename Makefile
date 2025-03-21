@@ -19,9 +19,9 @@ toolchain: ## Install toolchain for development
 build: ## Build the controller image
 	$(eval CONTROLLER_TAG=${VERSION})
 	$(eval CONTROLLER_IMG=${NLK_DOCKER_REPO}/node-latency-for-k8s:${CONTROLLER_TAG})
-	podman build --all-platforms -t ${CONTROLLER_IMG} .
-	$(eval CONTROLLER_DIGEST=$(shell podman image inspect ${CONTROLLER_IMG} | jq -r '.[0] .Digest'))
-	@echo Built ${CONTROLLER_IMG}
+	podman build --all-platforms --manifest ${CONTROLLER_IMG} .
+	$(eval CONTROLLER_DIGEST=$(shell podman manifest inspect ${CONTROLLER_IMG} | jq -r '.manifests[] | .digest + " " + .platform.architecture + "/" + .platform.os + "/" + .platform.variant ' ))
+	@echo Built multi-arch images and manifest ${CONTROLLER_IMG}
 
 publish: verify build docs ## Build and publish container images and helm chart
 	aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${NLK_DOCKER_REPO}
